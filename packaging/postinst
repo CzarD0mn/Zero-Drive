@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# The app draws to /dev/fb0 and reads the keyboard: give normal users access.
+for u in $(getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1}'); do
+    for grp in video input; do
+        getent group "$grp" >/dev/null && usermod -aG "$grp" "$u" || true
+    done
+done
+# Load the USB gadget + filesystem modules on demand later; nothing to start now.
+if [ -n "${SUDO_USER:-}" ]; then
+    su - "$SUDO_USER" -c 'systemctl --user restart APPLaunch.service' >/dev/null 2>&1 || true
+fi
+exit 0

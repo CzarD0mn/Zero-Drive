@@ -1,0 +1,426 @@
+#!/bin/bash
+# zd-helper — the privileged half of Zero-Drive. Run as root (via sudo).
+#
+#   zd-helper status
+#   zd-helper start   <folder> <extra_mb> <exfat|fat32>
+#   zd-helper stop    <folder> [user]
+#   zd-helper reset                  (remove gadget + restore host mode, no sync)
+#   zd-helper livemode               (one-time: old dwc_otg driver -> dwc2)
+#
+# How it works
+#   start: the chosen folder is copied into a fresh disk image
+#          (/var/lib/zero-drive/drive.img), which is then shared over USB as
+#          a mass-storage device through the Linux USB gadget (configfs) API.
+#          If the USB controller is in host mode it is switched to device
+#          mode on the fly (reload dwc2 with a runtime dr_mode=peripheral
+#          overlay) - no reboot.
+#   stop:  the USB gadget is removed, the image is mounted read-only and every
+#          change the computer made (new, edited, deleted files) is copied back
+#          into the folder, owned by the Cardputer user. The image is deleted.
+#          The controller is put back into host mode (USB-A, Ethernet, hub).
+#
+# Output lines understood by the UI:  STAGE <text> | WARN <text> |
+#                                     ERROR <text> | KV key=value | DONE
+set -uo pipefail
+trap '' PIPE HUP          # keep going even if the UI is closed mid-way
+
+# Protections (always on):
+#   * only sub-folders of a home folder (or /media, /mnt) can be shared
+#   * hidden files (.ssh, .config, ...) never go on the drive and are never touched
+#   * files changed on the Cardputer while shared are never overwritten or deleted
+NAME=zero-drive
+
+STATE_DIR=/var/lib/$NAME
+IMG=$STATE_DIR/drive.img
+STAMP=$STATE_DIR/drive.stamp
+MANIFEST=$STATE_DIR/manifest
+RUN_DIR=/run/$NAME
+MNT=$RUN_DIR/mnt
+SAVED=$RUN_DIR/other-gadgets
+SWITCHED=$RUN_DIR/usb-switched     # exists => we moved the port to device mode
+LOG=$RUN_DIR/log
+CFS=/sys/kernel/config
+GADGET=$CFS/usb_gadget/${NAME//-/}
+FUNC=$GADGET/functions/mass_storage.usb0
+CONFIG_TXT=/boot/firmware/config.txt
+[ -f "$CONFIG_TXT" ] || CONFIG_TXT=/boot/config.txt
+
+# Files computers like to drop on USB sticks; never copied back.
+EXCLUDES=(
+    --exclude='/System Volume Information' --exclude='/$RECYCLE.BIN'
+    --exclude='/.Trashes' --exclude='/.Spotlight-V100' --exclude='/.fseventsd'
+    --exclude='/.TemporaryItems' --exclude='/LOST.DIR' --exclude='/.android_secure'
+)
+
+mkdir -p "$STATE_DIR" "$RUN_DIR" "$MNT"
+chmod 700 "$STATE_DIR"
+
+say()   { echo "$*" 2>/dev/null || true; echo "$(date '+%F %T') $*" >>"$LOG" 2>/dev/null || true; }
+stage() { say "STAGE $*"; }
+kv()    { say "KV $*"; }
+unmount_img() { mountpoint -q "$MNT" && umount "$MNT" 2>>"$LOG"; return 0; }
+fail()  { local code=$1; shift; say "ERROR $*"; unmount_img; exit "$code"; }
+
+[ "$(id -u)" -eq 0 ] || fail 1 "zd-helper must run as root"
+
+udc_name() { ls /sys/class/udc 2>/dev/null | head -n1; }
+
+# Resolve and sanity-check the shared folder (root rsync must never touch
+# system directories).
+FOLDER=
+check_folder() {
+    local f
+    f=$(realpath -e -- "$1" 2>/dev/null) || fail 2 "Folder not found: $1"
+    [ -d "$f" ] || fail 2 "Not a folder: $f"
+    case "$f" in
+        /|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|\
+        /proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*|/var|/var/*|\
+        /home|/root|/opt|/srv)
+            fail 2 "Refusing to use system folder $f" ;;
+    esac
+    case "$f" in
+        /home/*/*|/media/*|/mnt/*) ;;
+        *) fail 2 "Choose a folder inside your home folder (or under /media or /mnt)" ;;
+    esac
+    FOLDER=$f
+}
+
+# ------------------------------------------------------ live USB switch ----
+usb_dev() {          # platform device of the SoC USB controller (3f980000.usb)
+    local d
+    for d in /sys/bus/platform/devices/*.usb; do
+        [ -r "$d/of_node/compatible" ] || continue
+        if tr '\0' '\n' <"$d/of_node/compatible" | grep -qE 'bcm2835-usb|bcm2708-usb|snps,dwc2'; then
+            basename "$d"; return 0
+        fi
+    done
+}
+usb_driver() {
+    local l=/sys/bus/platform/devices/$1/driver
+    [ -L "$l" ] && basename "$(readlink -f "$l")"
+}
+
+# Raspberry Pi OS trixie (rpi-6.12 arm64 kernel): dwc2 AND the legacy dwc_otg
+# are both built in (=y), so the controller is moved with sysfs unbind/bind -
+# `modprobe -r dwc2` does nothing there. The runtime overlay (OF_CONFIGFS=y)
+# flips dr_mode; removing it falls back to the boot-time dtoverlay=dwc2 mode.
+DWC2_DRV=/sys/bus/platform/drivers/dwc2
+
+runtime_dwc2_loaded() {      # `dtoverlay -l` lines look like "0:  dwc2  dr_mode=peripheral"
+    dtoverlay -l 2>/dev/null | grep -qE '^[0-9]+:[[:space:]]+dwc2([[:space:]]|$)'
+}
+
+reload_dwc2() {              # $1 = apply | remove
+    local dev i; dev=$(usb_dev)
+    [ -n "$dev" ] || return 1
+    if [ -e "$DWC2_DRV/$dev" ]; then
+        echo "$dev" >"$DWC2_DRV/unbind" 2>>"$LOG" || return 1
+    fi
+    for i in $(seq 1 25); do [ -z "$(usb_driver "$dev")" ] && break; sleep 0.2; done
+    i=0
+    while runtime_dwc2_loaded && [ $i -lt 5 ]; do       # ours (or a stale one)
+        dtoverlay -r dwc2 2>>"$LOG" || break
+        i=$((i + 1))
+    done
+    if [ "$1" = apply ]; then
+        dtoverlay dwc2 dr_mode=peripheral 2>>"$LOG" || { bind_dwc2 "$dev"; return 1; }
+    fi
+    bind_dwc2 "$dev"
+}
+
+bind_dwc2() {
+    local i
+    [ -d "$DWC2_DRV" ] || modprobe dwc2 2>>"$LOG" || true      # only if ever built as a module
+    [ -n "$(usb_driver "$1")" ] || echo "$1" >"$DWC2_DRV/bind" 2>>"$LOG" || true
+    for i in $(seq 1 25); do [ "$(usb_driver "$1")" = dwc2 ] && return 0; sleep 0.2; done
+    return 1
+}
+
+wait_udc() {
+    local i
+    for i in $(seq 1 30); do [ -n "$(udc_name)" ] && return 0; sleep 0.2; done
+    return 1
+}
+
+usb_dr_mode() {              # effective device-tree dr_mode: host | peripheral | otg | ""
+    local f=/sys/bus/platform/devices/$1/of_node/dr_mode
+    [ -r "$f" ] && tr -d '\0' <"$f"
+}
+
+usb_device_on() {
+    local mode; mode=$(usb_dr_mode "$(usb_dev)")
+    # Already forced to device mode (e.g. ADB set dr_mode=peripheral): use as is.
+    # "otg" also exposes a UDC, but the role then follows the ID pin, so it is
+    # forced to peripheral too for a reliable connection.
+    if [ "$mode" = peripheral ]; then return 0; fi
+    if [ -z "$mode" ] && [ -n "$(udc_name)" ]; then return 0; fi
+    command -v dtoverlay >/dev/null || fail 11 "The 'dtoverlay' tool is missing (sudo apt install raspi-utils-dt)"
+    [ -d /sys/kernel/config/device-tree ] || mount -t configfs none "$CFS" 2>/dev/null || true
+    local dev drv; dev=$(usb_dev); drv=$(usb_driver "$dev")
+    [ -n "$dev" ] || fail 11 "USB controller not found"
+    if [ "$drv" != dwc2 ]; then          # dwc_otg (default without dtoverlay=dwc2)
+        fail 12 "USB uses the legacy ${drv:-unknown} driver, which cannot switch modes live."
+    fi
+    stage "Switching USB to device mode"
+    touch "$SWITCHED"
+    if ! reload_dwc2 apply || ! wait_udc; then
+        usb_host_restore
+        fail 11 "Could not switch USB to device mode (see $LOG)"
+    fi
+}
+
+usb_host_restore() {
+    [ -f "$SWITCHED" ] || return 0
+    stage "Switching USB back to host mode"
+    reload_dwc2 remove || say "WARN USB host mode did not come back; replug or reboot (see $LOG)"
+    rm -f "$SWITCHED"
+}
+
+stamp_of() { stat -c '%y %s' "$IMG" 2>/dev/null; }   # ns precision
+
+# ---------------------------------------------------------------- gadget ----
+start_gadget() {
+    local udc=$1 g u
+    modprobe libcomposite 2>>"$LOG" || true
+    mountpoint -q "$CFS" || mount -t configfs none "$CFS" 2>>"$LOG" || true
+    [ -d "$CFS/usb_gadget" ] || fail 3 "USB gadget support (configfs) is not available"
+
+    # Only one gadget can own the USB port. Pause ADB / others, restore later.
+    : >"$SAVED"
+    if systemctl is-active --quiet adbd.service 2>/dev/null; then
+        echo "service adbd.service" >>"$SAVED"
+        systemctl stop adbd.service 2>>"$LOG" || true
+    fi
+    for g in "$CFS"/usb_gadget/*; do
+        [ "$g" = "$GADGET" ] && continue
+        [ -f "$g/UDC" ] || continue
+        u=$(cat "$g/UDC" 2>/dev/null)
+        if [ -n "$u" ]; then
+            echo "gadget $g $u" >>"$SAVED"
+            echo "" >"$g/UDC" 2>>"$LOG" || true
+        fi
+    done
+
+    mkdir -p "$GADGET" || fail 3 "Could not create USB gadget"
+    (
+        set -e
+        cd "$GADGET"
+        echo 0x1d6b >idVendor          # Linux Foundation
+        echo 0x0104 >idProduct         # Multifunction Composite Gadget
+        echo 0x0100 >bcdDevice
+        echo 0x0200 >bcdUSB
+        mkdir -p strings/0x409
+        echo "M5Stack"    >strings/0x409/manufacturer
+        echo "Zero-Drive" >strings/0x409/product
+        if [ -r /etc/machine-id ]; then
+            echo "ZD$(cut -c1-10 /etc/machine-id)" >strings/0x409/serialnumber
+        else
+            echo "ZD0000000001" >strings/0x409/serialnumber
+        fi
+        mkdir -p configs/c.1/strings/0x409
+        echo "Mass Storage" >configs/c.1/strings/0x409/configuration
+        echo 250 >configs/c.1/MaxPower
+        mkdir -p functions/mass_storage.usb0
+        echo 1 >"$FUNC/lun.0/removable"
+        echo 0 >"$FUNC/lun.0/ro"
+        echo 0 >"$FUNC/lun.0/cdrom"
+        [ -e "$FUNC/lun.0/inquiry_string" ] && echo "M5Stack Zero-Drive" >"$FUNC/lun.0/inquiry_string" || true
+        echo "$IMG" >"$FUNC/lun.0/file"
+        ln -s "$FUNC" configs/c.1/
+        echo "$udc" >UDC
+    ) 2>>"$LOG" || { teardown_gadget; usb_host_restore; fail 3 "Could not start the USB drive (see $LOG)"; }
+}
+
+teardown_gadget() {
+    if [ -d "$GADGET" ]; then
+        echo "" >"$GADGET/UDC" 2>/dev/null || true
+        echo "" >"$FUNC/lun.0/file" 2>/dev/null || true
+        rm -f "$GADGET/configs/c.1/mass_storage.usb0" 2>/dev/null
+        rmdir "$GADGET/configs/c.1/strings/0x409" "$GADGET/configs/c.1" \
+              "$FUNC" "$GADGET/strings/0x409" "$GADGET" 2>/dev/null
+    fi
+    # Give ADB / other gadgets their port back.
+    if [ -f "$SAVED" ]; then
+        local kind a b
+        while read -r kind a b; do
+            case "$kind" in
+                gadget)  [ -f "$a/UDC" ] && echo "$b" >"$a/UDC" 2>>"$LOG" || true ;;
+                service) systemctl start "$a" 2>>"$LOG" || true ;;
+            esac
+        done <"$SAVED"
+        rm -f "$SAVED"
+    fi
+}
+
+# --------------------------------------------------------------- commands ---
+cmd_status() {
+    local udc; udc=$(udc_name)
+    kv "udc=${udc:-none}"
+    kv "usb_driver=$(usb_driver "$(usb_dev)")"
+    kv "usb_dr_mode=$(usb_dr_mode "$(usb_dev)")"
+    [ -d "$GADGET" ] && kv "gadget=active" || kv "gadget=none"
+    [ -f "$IMG" ] && kv "image=present" || kv "image=none"
+    say "DONE"
+}
+
+HIDDEN_EXCL=(--exclude='.*')     # hidden files stay private, both directions
+
+cmd_start() {
+    local f extra fs udc used size avail rc
+    check_folder "${1:-}"; f=$FOLDER
+    extra=${2:-2048}; fs=${3:-exfat}
+    [[ "$extra" =~ ^[0-9]+$ ]] || fail 2 "Bad size"
+
+    teardown_gadget
+    unmount_img
+
+    stage "Measuring folder"
+    used=$(du -smx --apparent-size --exclude='.*' -- "$f" 2>/dev/null | cut -f1)
+    used=${used:-0}
+    rm -f "$IMG" "$STAMP" "$MANIFEST"
+    avail=$(df -Pm "$STATE_DIR" | awk 'NR==2{print $4}')
+    [ $((used + 256)) -lt "$avail" ] || fail 4 "Not enough free space on the card (need ${used} MB + room to copy)"
+    size=$((used + used / 10 + extra + 64))
+    if [ "$size" -gt $((avail - 256)) ]; then
+        size=$((avail - 256))
+        say "WARN Drive size reduced to ${size} MB to fit the card"
+    fi
+    kv "size_mb=$size"
+    kv "used_mb=$used"
+
+    stage "Creating ${size} MB drive"
+    truncate -s "${size}M" "$IMG" || fail 5 "Could not create the drive image"
+    local maxsize=()
+    case "$fs" in
+        fat32) mkfs.vfat -F 32 -n ZERODRIVE "$IMG" >>"$LOG" 2>&1 || fail 5 "mkfs.vfat failed"
+               maxsize=(--max-size=4095m) ;;          # FAT32 limit
+        *)     mkfs.exfat -L ZERODRIVE "$IMG" >>"$LOG" 2>&1 || fail 5 "mkfs.exfat failed" ;;
+    esac
+
+    stage "Copying files to drive"
+    mount -o loop "$IMG" "$MNT" 2>>"$LOG" || fail 5 "Could not mount the drive image"
+    rsync -rt --modify-window=2 "${maxsize[@]}" "${EXCLUDES[@]}" "${HIDDEN_EXCL[@]}" -- "$f/" "$MNT/" >>"$LOG" 2>&1
+    rc=$?
+    case $rc in
+        0|24) ;;
+        23) say "WARN Some files could not be copied (names or sizes not allowed on $fs)" ;;
+        *)  unmount_img; rm -f "$IMG"; fail 5 "Copy failed (rsync $rc)" ;;
+    esac
+    # Remember exactly what the computer was given, so that on stop we only
+    # delete files the computer actually deleted.
+    (cd "$MNT" && find . -mindepth 1 -printf '%y %P\0') >"$MANIFEST"
+    unmount_img
+    sync
+    stamp_of >"$STAMP"
+
+    usb_device_on
+    udc=$(udc_name)
+    [ -n "$udc" ] || fail 11 "No USB device controller available"
+    stage "Starting USB drive"
+    start_gadget "$udc"
+    kv "udc=$udc"
+    say "DONE"
+}
+
+cmd_stop() {
+    local f user rc t p
+    check_folder "${1:-}"; f=$FOLDER
+    user=${SUDO_USER:-${2:-}}
+
+    stage "Disconnecting USB"
+    teardown_gadget
+    sync; sleep 0.5
+    usb_host_restore
+
+    if [ ! -f "$IMG" ]; then kv "changed=0"; say "DONE"; return 0; fi
+
+    if [ -f "$STAMP" ] && [ "$(stamp_of)" = "$(cat "$STAMP")" ]; then
+        stage "No changes made"
+        kv "changed=0"
+    else
+        stage "Checking drive"
+        case "$(blkid -o value -s TYPE "$IMG" 2>/dev/null)" in
+            vfat)  fsck.vfat -a "$IMG"  >>"$LOG" 2>&1 ;;
+            exfat) fsck.exfat -y "$IMG" >>"$LOG" 2>&1 ;;
+        esac
+        stage "Saving files to folder"
+        mount -o loop,ro "$IMG" "$MNT" 2>>"$LOG" \
+            || fail 7 "Drive could not be read. Kept at $IMG"
+        rsync -rt --modify-window=2 --update "${EXCLUDES[@]}" "${HIDDEN_EXCL[@]}" -- "$MNT/" "$f/" >>"$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && [ $rc -ne 23 ] && [ $rc -ne 24 ]; then
+            unmount_img; fail 7 "Saving failed (rsync $rc). Drive kept at $IMG"
+        fi
+        [ $rc -eq 23 ] && say "WARN Some files could not be saved"
+        # Apply deletions: only for things that were on the drive at start.
+        local dirs=()
+        if [ -f "$MANIFEST" ]; then
+            while IFS= read -r -d '' entry; do
+                t=${entry%% *}; p=${entry#* }
+                [ -n "$p" ] || continue
+                if [ ! -e "$MNT/$p" ] && [ ! -L "$MNT/$p" ]; then
+                    case "$t" in
+                        f)  # keep it if the Cardputer changed it while shared
+                            if [ "$f/$p" -nt "$STAMP" ]; then
+                                say "WARN Kept $p (changed on the Cardputer)"
+                            else
+                                rm -f -- "$f/$p"
+                            fi ;;
+                        d) dirs+=("$p") ;;
+                    esac
+                fi
+            done <"$MANIFEST"
+            local i
+            for ((i = ${#dirs[@]} - 1; i >= 0; i--)); do
+                rmdir -- "$f/${dirs[$i]}" 2>/dev/null || true
+            done
+        fi
+        unmount_img
+        kv "changed=1"
+    fi
+
+    # Hand the files to the Cardputer user so they are usable after disconnect.
+    if [ -n "$user" ] && id -u "$user" >/dev/null 2>&1; then
+        stage "Fixing permissions"
+        local hp=(-not -path '*/.*')
+        find "$f" -mindepth 1 "${hp[@]}" -uid 0 \( -type f -o -type d \) \
+            -exec chown "$(id -u "$user"):$(id -g "$user")" {} + 2>/dev/null
+        find "$f" -mindepth 1 "${hp[@]}" -type d -user "$user" -exec chmod u+rwx {} + 2>/dev/null
+        find "$f" -mindepth 1 "${hp[@]}" -type f -user "$user" -exec chmod u+rw {} + 2>/dev/null
+    fi
+
+    rm -f "$IMG" "$STAMP" "$MANIFEST"
+    sync
+    say "DONE"
+}
+
+cmd_reset() {
+    teardown_gadget
+    usb_host_restore
+    unmount_img
+    say "DONE"
+}
+
+# One-time fix for images still on the legacy dwc_otg driver (it crashes if
+# unbound, so it can never switch live). Keeps host mode, but on the mainline
+# dwc2 driver, which Zero-Drive can then switch on the fly. Needs one reboot.
+cmd_livemode() {
+    cp -n "$CONFIG_TXT" "$CONFIG_TXT.zero-drive.bak" 2>/dev/null || true
+    if grep -qE '^[[:space:]]*dtoverlay=dwc2' "$CONFIG_TXT"; then
+        kv "reboot=0"; say "DONE"; return 0
+    fi
+    sed -i 's/^[[:space:]]*otg_mode=1.*/# otg_mode=1  # disabled by zero-drive/' "$CONFIG_TXT"
+    printf '\n[all]\ndtoverlay=dwc2,dr_mode=host\n' >>"$CONFIG_TXT"
+    kv "reboot=1"
+    say "DONE"
+}
+
+case "${1:-}" in
+    status)  cmd_status ;;
+    start)   shift; cmd_start "$@" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    reset)    cmd_reset ;;
+    livemode) cmd_livemode ;;
+    reboot)  say "DONE"; systemctl reboot ;;
+    *) echo "usage: $0 status|start|stop|reset|livemode|reboot" >&2; exit 2 ;;
+esac

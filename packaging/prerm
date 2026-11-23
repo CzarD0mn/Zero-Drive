@@ -1,0 +1,7 @@
+#!/bin/sh
+# If the drive is still being shared while the app is removed: stop the USB
+# gadget and put the port back into host mode. Anything the computer wrote
+# stays in /var/lib/zero-drive/drive.img.
+H=/usr/share/APPLaunch/apps/zero-drive/zd-helper
+[ -x "$H" ] && "$H" reset >/dev/null 2>&1 || true
+exit 0
